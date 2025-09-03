@@ -1,0 +1,236 @@
+# .github/workflows/kokoro-tts-deploy.yml
+name: Deploy Kokoro TTS API with Forever Running
+
+on:
+  workflow_dispatch:  # Manual and API trigger
+    inputs:
+      restart_reason:
+        description: 'Reason for restart'
+        required: false
+        default: 'manual_trigger'
+        type: string
+
+env:
+  DOCKER_IMAGE: rajaryanx/kokoro-tts-api
+  PORT: 8080
+  RUNTIME_HOURS: 4  # Run for 4 hours before auto-restart
+
+jobs:
+  deploy:
+    runs-on: macos-14  # Apple Silicon M1 - FREE for public repos!
+    timeout-minutes: 300  # 5 hours max (4h runtime + 1h buffer)
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    # Cache Docker image using GitHub Actions cache
+    - name: Cache Docker image
+      uses: actions/cache@v4
+      id: docker-cache
+      with:
+        path: /tmp/docker-image
+        key: docker-${{ env.DOCKER_IMAGE }}-${{ hashFiles('**/Dockerfile', '**/requirements.txt', '**/package*.json') }}
+        restore-keys: |
+          docker-${{ env.DOCKER_IMAGE }}-
+
+    # If cache miss, pull and save image
+    - name: Log in to Docker Hub
+      if: steps.docker-cache.outputs.cache-hit != 'true'
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Pull and cache Docker image
+      if: steps.docker-cache.outputs.cache-hit != 'true'
+      run: |
+        echo "Cache miss - pulling fresh image"
+        docker pull ${{ env.DOCKER_IMAGE }}:latest
+        mkdir -p /tmp/docker-image
+        docker save ${{ env.DOCKER_IMAGE }}:latest -o /tmp/docker-image/kokoro-tts.tar
+        echo "Image cached successfully"
+
+    # If cache hit, load image
+    - name: Load cached Docker image
+      if: steps.docker-cache.outputs.cache-hit == 'true'
+      run: |
+        echo "Cache hit - loading cached image"
+        docker load -i /tmp/docker-image/kokoro-tts.tar
+        echo "Cached image loaded successfully"
+
+    - name: Start Docker container
+      run: |
+        echo "Starting Kokoro TTS container..."
+        docker run -d \
+          --name kokoro-tts \
+          --restart unless-stopped \
+          -p ${{ env.PORT }}:${{ env.PORT }} \
+          ${{ env.DOCKER_IMAGE }}:latest
+        
+        # Show container status
+        docker ps -a
+        
+    - name: Wait for application to start
+      run: |
+        echo "Waiting for application to start..."
+        for i in {1..30}; do
+          if curl -f http://localhost:${{ env.PORT }}/health 2>/dev/null || curl -f http://localhost:${{ env.PORT }} 2>/dev/null; then
+            echo "✅ Application is ready!"
+            break
+          fi
+          echo "Attempt $i/30 - waiting..."
+          sleep 5
+        done
+        
+        # Check if app is actually running
+        if ! curl -f http://localhost:${{ env.PORT }} 2>/dev/null; then
+          echo "❌ Application failed to start properly"
+          docker logs kokoro-tts
+          exit 1
+        fi
+
+    - name: Setup ngrok
+      run: |
+        # Download and install ngrok
+        curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+        echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+        sudo apt update
+        sudo apt install ngrok
+        
+        # Configure ngrok with auth token
+        ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+
+    - name: Start ngrok tunnel with static domain
+      run: |
+        # Start ngrok in background with static domain
+        nohup ngrok http --domain=${{ secrets.NGROK_STATIC_DOMAIN }} ${{ env.PORT }} > ngrok.log 2>&1 &
+        
+        # Wait for ngrok to start and get status
+        echo "Starting ngrok tunnel..."
+        sleep 15
+        
+        # Verify ngrok is running
+        if ! pgrep ngrok > /dev/null; then
+          echo "❌ ngrok failed to start"
+          cat ngrok.log
+          exit 1
+        fi
+        
+        # Set tunnel URL
+        TUNNEL_URL="https://${{ secrets.NGROK_STATIC_DOMAIN }}"
+        echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+        echo "✅ ngrok tunnel started: $TUNNEL_URL"
+
+    - name: Verify tunnel connectivity
+      run: |
+        echo "Testing tunnel connection..."
+        for i in {1..10}; do
+          if curl -f ${{ env.TUNNEL_URL }}/health 2>/dev/null || curl -f ${{ env.TUNNEL_URL }} 2>/dev/null; then
+            echo "✅ Tunnel is working!"
+            break
+          fi
+          echo "Attempt $i/10 - tunnel not ready yet..."
+          sleep 10
+        done
+        
+        # Final verification
+        if ! curl -f ${{ env.TUNNEL_URL }} 2>/dev/null; then
+          echo "❌ Tunnel verification failed"
+          cat ngrok.log
+          exit 1
+        fi
+
+    - name: Send startup notification to n8n webhook
+      run: |
+        echo "Sending startup notification..."
+        curl -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
+          -H "Content-Type: application/json" \
+          -d '{"status": "running", "url": "${{ env.TUNNEL_URL }}", "runtime_hours": ${{ env.RUNTIME_HOURS }}, "started_at": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"}' \
+          || echo "⚠️  Failed to send webhook notification"
+
+    - name: Keep service running with health monitoring
+      run: |
+        echo "🚀 Kokoro TTS API is now running!"
+        echo "📡 Tunnel URL: ${{ env.TUNNEL_URL }}"
+        echo "🐳 Docker container: kokoro-tts"
+        echo "⏱️  Runtime: ${{ env.RUNTIME_HOURS }} hours"
+        echo "🔄 Auto-restart: enabled"
+        echo ""
+        
+        # Calculate end time
+        END_TIME=$(date -d "+${{ env.RUNTIME_HOURS }} hours" +%s)
+        CURRENT_TIME=$(date +%s)
+        
+        # Health monitoring loop
+        while [ $CURRENT_TIME -lt $END_TIME ]; do
+          # Check if Docker container is still running
+          if ! docker ps | grep -q kokoro-tts; then
+            echo "❌ Docker container stopped unexpectedly!"
+            docker logs kokoro-tts --tail 50
+            exit 1
+          fi
+          
+          # Check if ngrok is still running
+          if ! pgrep ngrok > /dev/null; then
+            echo "❌ ngrok process died!"
+            cat ngrok.log
+            exit 1
+          fi
+          
+          # Health check via tunnel
+          if ! curl -f ${{ env.TUNNEL_URL }} 2>/dev/null; then
+            echo "⚠️  Health check failed at $(date)"
+            # Try to restart ngrok
+            pkill ngrok || true
+            sleep 5
+            nohup ngrok http --domain=${{ secrets.NGROK_STATIC_DOMAIN }} ${{ env.PORT }} > ngrok.log 2>&1 &
+            sleep 10
+          fi
+          
+          CURRENT_TIME=$(date +%s)
+          REMAINING=$((END_TIME - CURRENT_TIME))
+          REMAINING_HOURS=$((REMAINING / 3600))
+          REMAINING_MINS=$(((REMAINING % 3600) / 60))
+          
+          echo "⏰ Service running... ${REMAINING_HOURS}h ${REMAINING_MINS}m remaining ($(date))"
+          sleep 300  # Check every 5 minutes
+        done
+        
+        echo "⏰ Runtime limit reached. Preparing for restart..."
+
+    - name: Trigger next workflow run
+      if: always()
+      run: |
+        echo "🔄 Triggering next workflow run..."
+        
+        # Trigger workflow via GitHub API
+        curl -X POST \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/repos/${{ github.repository }}/actions/workflows/kokoro-tts-deploy.yml/dispatches \
+          -d '{"ref":"${{ github.ref_name }}", "inputs":{"restart_reason":"auto_restart_after_'${{ env.RUNTIME_HOURS }}'h"}}' \
+          || echo "⚠️  Failed to trigger next run - manual restart may be needed"
+        
+        echo "✅ Next workflow triggered successfully"
+
+    - name: Send shutdown notification
+      if: always()
+      run: |
+        echo "Sending shutdown notification..."
+        curl -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
+          -H "Content-Type: application/json" \
+          -d '{"status": "shutting_down", "url": "${{ env.TUNNEL_URL }}", "shutdown_at": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'", "next_restart": "triggered"}' \
+          || echo "⚠️  Failed to send shutdown webhook"
+
+    - name: Cleanup
+      if: always()
+      run: |
+        echo "🧹 Cleaning up..."
+        docker stop kokoro-tts 2>/dev/null || true
+        docker rm kokoro-tts 2>/dev/null || true
+        pkill ngrok 2>/dev/null || true
+        echo "✅ Cleanup completed"
