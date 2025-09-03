@@ -1,0 +1,12 @@
+fastapi==0.112.2
+uvicorn[standard]==0.30.6
+
+# runtime pins to avoid the NumPy/SciPy/transformers import chain issues
+numpy==1.26.4
+transformers==4.41.2
+torch==2.4.1
+
+# kokoro + audio
+kokoro>=0.9.4
+soundfile
+misaki[en]
