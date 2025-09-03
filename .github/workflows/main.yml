@@ -17,7 +17,7 @@ env:
 
 jobs:
   deploy:
-    runs-on: macos-14  # Apple Silicon M1 - FREE for public repos!
+    runs-on: ubuntu-latest  # Apple Silicon M1 - FREE for public repos!
     timeout-minutes: 300  # 5 hours max (4h runtime + 1h buffer)
     
     steps:
