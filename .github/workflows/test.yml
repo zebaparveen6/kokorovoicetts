@@ -1,0 +1,42 @@
+# .github/workflows/kokoro-tts-deploy.yml
+name: test webhook
+
+on:
+  workflow_dispatch:  # Manual and API trigger
+    inputs:
+      restart_reason:
+        description: 'Reason for restart'
+        required: false
+        default: 'manual_trigger'
+        type: string
+        
+jobs:
+  deploy:
+    runs-on: ubuntu-latest  # Apple Silicon M1 - FREE for public repos!
+    timeout-minutes: 300  # 5 hours max (4h runtime + 1h buffer)
+    
+    steps:
+    - name: Trigger next workflow run
+      if: always()
+      run: |
+        echo "🔄 Triggering next workflow run..."
+        
+        # Trigger workflow via GitHub API
+        curl -X POST \
+          -H "Authorization: Bearer ${{ secrets.GGITHUB_TOKEN }}" \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches \
+          -d '{"ref":"${{ github.ref_name }}", "inputs":{"restart_reason":"auto_restart_after_'${{ env.RUNTIME_HOURS }}'h"}}' \
+          || echo "⚠️  Failed to trigger next run - manual restart may be needed"
+        
+        echo "✅ Next workflow triggered successfully"
+
+    - name: Send shutdown notification
+      if: always()
+      run: |
+        echo "Sending shutdown notification..."
+        curl -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
+          -H "Content-Type: application/json" \
+          -d '{"status": "shutting_down", "url": "${{ env.TUNNEL_URL }}", "shutdown_at": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'", "next_restart": "triggered"}' \
+          || echo "⚠️  Failed to send shutdown webhook"
